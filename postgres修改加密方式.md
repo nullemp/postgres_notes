@@ -58,7 +58,7 @@ select usename,passwd from pg_user;
 select rolname,rolpassword from pg_roles;
 
 ```
-[![查看用户密码信息](./image/Snipaste_2023-11-03_18-47-59.png "password")](https://markdown.com.cn)
+[![查看用户密码信息](./image/Snipaste_2023-11-03_18-47-59.png "password")](https://github.com/nullemp/postgres_notes/blob/master/image/Snipaste_2023-11-03_18-47-59.png?raw=true)
 
 ### 3.2 升级步骤
 1. 开发确定客户端工具驱动支持scram-sha-256的加密方式，不支持则需要进行客户端升级
@@ -79,7 +79,7 @@ select pg_reload_conf();
 
 ```
 \password username
-
+alter user $username with password $password
 ```
 5. 查看用户密码是否全部修改成sha-256
 
