@@ -1,0 +1,220 @@
+# EXIST类型子连接提升
+
+## 1. 提升条件
+
+1. EXIST类型的子连接的子句中如果包含CTE，子连接不能提升，因为提升之后会改变语义。
+e.g.
+
+```
+WITH cte AS (
+    SELECT score.sno 
+    FROM score, student
+    WHERE score.sno > student.sno
+)
+SELECT * 
+FROM student
+WHERE EXISTS (SELECT sno FROM cte);
+
+```
+[![执行计划](../image/Snipaste_2023-11-17_17-10-13.png "执行计划")]()
+
+[![查询树](../image/sample11.node.jpg "查询树")]()
+
+```
+if (subselect->cteList)
+	return NULL;
+```
+2. EXIST类型的子连接的子句中不能含有复杂的结构或者操作
+   下面是PG对于“复杂”的定义：
+   ```  
+    :jointree
+      {FROMEXPR
+      :fromlist (
+         {RANGETBLREF
+         :rtindex 1
+         }
+      )
+      :quals
+         {SUBLINK
+         :subLinkType 0
+         :subLinkId 0
+         :testexpr <>
+         :operName <>
+         :subselect
+            {QUERY
+            :commandType 1
+            :querySource 0
+            :canSetTag true
+            :utilityStmt <>
+            :resultRelation 0
+            :hasAggs false
+            :hasWindowFuncs false
+            ....
+
+	if (query->commandType != CMD_SELECT || // 必须是select子句
+		query->setOperations ||             // 子句中不能带有集合操作
+		query->hasAggs ||                   // 子句中不能带有聚合函数
+		query->groupingSets ||              // 不能有 group by grouping sets 这样的子句
+		query->hasWindowFuncs ||            // 不能有窗口函数
+		query->hasTargetSRFs ||             // 不能有generate series函数
+		query->hasModifyingCTE ||           // 不能有update、insert语句的通用表达式
+		query->havingQual ||                // 不能有having子句
+		query->limitOffset ||               // 不能有limit...offset
+		query->rowMarks)                    // 不能有select...for update子句
+		return false;
+   ```
+子句含有limit情况的处理：
+e.g. 
+```
+-- 假设有一个名为 orders 的表，包含订单信息
+CREATE TABLE orders (
+    order_id SERIAL PRIMARY KEY,
+    customer_id INTEGER,
+    order_date DATE
+);
+
+-- 假设有一个名为 customers 的表，包含客户信息
+CREATE TABLE customers (
+    customer_id SERIAL PRIMARY KEY,
+    customer_name VARCHAR(50)
+);
+
+-- 插入一些订单和客户信息
+INSERT INTO customers (customer_name) VALUES
+    ('Customer A'),
+    ('Customer B'),
+    ('Customer C);
+
+INSERT INTO orders (customer_id, order_date) VALUES
+    (1, '2023-01-01'),
+    (2, '2023-01-02'),
+    (1, '2023-01-03'),
+    (2, '2023-01-04'),
+    (2, '2023-01-05'),
+    (3, '2023-10-03');
+
+-- 查询是否存在至多两个订单的客户
+SELECT customer_id, customer_name
+FROM customers c
+WHERE EXISTS (
+    SELECT 1
+    FROM orders o
+    WHERE o.customer_id = c.customer_id
+    LIMIT 2
+);
+
+```
+[![查询树](../image/sample12.node.jpg "查询树")]()
+
+具有常量正值（或 NULL）的 LIMIT 不会影响 EXISTS 的语义，因此让我们忽略这样的子句。这是值得做的，因为习惯于某些其他数据库管理系统的人可能习惯于将 EXISTS(SELECT ... LIMIT 1) 编写为一种优化。然而，如果 LIMIT 的参数是其他任何值，我们就无法简化。主要还是EXIST类型子连接找到一个即可。
+
+```
+	if (query->limitCount)
+	{
+    /*  
+        LIMIT 子句尚未经过 eval_const_expressions 处理，
+        因此我们必须在这里应用该处理。这可能看起来像是在浪费计算资源。
+        因为唯一值得担心的情况可能只是 "LIMIT 1" 
+        但实际上我们会看到的是 "LIMIT int8(1::int4)"，因此我们必须折叠常量，否则我们将无法识别它。
+    */
+
+		Node	   *node = eval_const_expressions(root, query->limitCount);
+		Const	   *limit;
+
+		/* Might as well update the query if we simplified the clause. */
+		query->limitCount = node;
+
+		if (!IsA(node, Const))
+			return false;
+
+		limit = (Const *) node;
+		Assert(limit->consttype == INT8OID);
+		if (!limit->constisnull && DatumGetInt64(limit->constvalue) <= 0)
+			return false;
+
+		/* Whether or not the targetlist is safe, we can drop the LIMIT. */
+		query->limitCount = NULL;
+	}
+
+
+    /*
+     否则，我们可以丢弃目标列表，
+     以及任何 GROUP、WINDOW、DISTINCT 和 ORDER BY 子句；
+     这些子句都不会将非零行的结果变为零行，反之亦然。 
+    （此外，由于我们对这些子句的解析树表示依赖于目标列表，如果我们丢弃了目标列表，最好也将它们丢弃。）
+    */
+
+    query->targetList = NIL;
+	query->groupClause = NIL;
+	query->windowClause = NIL;
+	query->distinctClause = NIL;
+	query->sortClause = NIL;
+	query->hasDistinctOn = false;
+
+	return true;
+
+```
+e.g.
+```
+SELECT column1, column2 FROM table1 WHERE column3 = 'some_value' GROUP BY column1 ORDER BY column2;
+根据上面的注释，如果我们已经确定结果的行数不为零（即存在满足 WHERE 子句条件的行），那么可以丢弃目标列表、GROUP BY、WINDOW、DISTINCT 和 ORDER BY 子句，因为它们不会影响查询结果的行数
+
+SELECT * FROM table1 WHERE column3 = 'some_value';
+这是因为在已知至少有一行满足条件的情况下，目标列表和排序规则等不会改变结果集的行数。这样的优化可以减轻查询计划的复杂性和计算负担，提高查询性能。
+```
+3. EXIST类型的子连接的子句中，如果约束条件（ WHERE/ON ）中没有包含上层的列属性（Var ），这种情况无须将子连接提升为 JOIN ，通常直接对子连接单独生成子计划求解代价更低。例如有 SQL 语句 SELECT * FROM STUDENT WHE EXISTS (SELECT * FROM SCORE），这个子连接中没有引用父查询的列属性，因此无须提升。
+```
+	/*
+	 * On the other hand, the WHERE clause must contain some Vars of the parent query, else it's not gonna be a join.
+	 */
+	if (!contain_vars_of_level(whereClause, 1))
+		return NULL;
+```
+4. EXISTS 类型的子连接的子句中如果除了约束条件之外的其他表达式如果引用了上层父
+查询的列属性（ Var ），子连接不能提升。同时，子连接的约束条件中则必须包含上层
+父查询的列属性，否则不能提升。
+
+5. EXISTS 类型的子连接的约束条件（ Whereclause ）中如果含有易失性函数，子连接不能提升
+
+## 2. 提升流程
+
+EXIST类型的子链接没有左操作数，区别于ANY类型的子句。
+e.g.
+```
+SELECT sno FROM student WHERE EXISTS (SELECT sno FROM score WHERE sno > student.sno);
+```
+
+[![执行计划](../image/Snipaste_2023-11-17_16-49-06.png "执行计划")]()
+
+[![查询树](../image/sample10.node.jpg "查询树")]()
+
+通过观察执行计划可以直接看到，EXIST类型子连接提升做了以下几步：
+* SubLink->subselect->rtable 将被提升到上层，和上层表形成 SemiJoin 关系
+* SubLink->subselect->FromExpr->quals 会被提升到上层变成约束条件
+* 在将子连接的范围约束条件提升后，还需要调整 SubLink->subselect 查询树中的 Var 变量中的 varno varlevelsup。
+
+所以提升后样子类似于：
+```
+SELECT sno FROM STUDENT SEMI JOIN SCORE WHERE SCORE .sno > STUDENT .sno ; 
+```
+
+1. quals提升，quals置为NULL，在这之前备份到whereClause
+    ```
+    whereClause = subselect->jointree->quals; 
+    subselect->jointree->quals = NULL ;
+    ```
+2. 将子查询提升到顶层范围表。 这里依赖一个假设，即外部查询不引用内部查询（这是肯定的）。因此，这比 pull_up_subqueries 需要经历的过程要简单得多。实际上，这甚至比 convert_ANY_sublink_to_join 需要做的更简单。simplify_EXISTS_query 的操作确保子查询中没有多余的东西，除了一个 rtable 和 jointree，甚至 jointree 的 FromExpr 不再有 quals。因此，我们只需将 rtable 追加到我们自己的 rtable 中，并在我们的 jointree 中使用 FromExpr。但首先，调整子查询中所有级别为零的 varnos 以适应 rtable 的合并。同时对于SubLink->subselect 中的 RangeTableRef rtindex 要按照新的 rtindex 做调整。
+   ```
+    rtoffset = list_length(parse->rtable);
+	OffsetVarNodes((Node *) subselect, rtoffset, 0);
+	OffsetVarNodes(whereClause, rtoffset, 0);
+   ```
+3. 子查询中的上层变量现在将比以前更接近其父级；特别是，任何之前位于级别 1 的变量现在变为级别 0。
+   ```
+    IncrementVarSublevelsUp((Node *) subselect, -1, 1);
+	IncrementVarSublevelsUp(whereClause, -1, 1);
+   ```
+4. 
+
+
+
